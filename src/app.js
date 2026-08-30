@@ -45,6 +45,13 @@ const CARD_IMAGES = {
   outlier: "images/card_outlier_removal.png", swap: "images/card_swap_labels.png",
   audit: "images/card_audit.png", decrease: "images/card_decrease_significance_threshold.png",
 };
+const AI_MODES = {
+  random: { label: "Dice goblin", description: "Chooses legal moves randomly." },
+  opportunist: { label: "Opportunist", description: "Looks for an immediate win or block." },
+  tactician: { label: "Stats sleuth", description: "Uses the board’s current trends." },
+  aggressive: { label: "P-hacking mastermind", description: "Pushes hard toward its own theory." },
+  oracle: { label: "Oracle of significance", description: "Looks ahead before committing." },
+};
 const COPY_BLOCKED = new Set(["challenge", "decrease"]);
 const app = document.querySelector("#app");
 let state = null;
@@ -71,8 +78,9 @@ function currentPlayer() { return state.players[state.current]; }
 function colorForPlayer(player) { return state.redPlayer === player ? "red" : "blue"; }
 function contextRole(player) { return `Researcher for ${state.context.options[colorForPlayer(player) === "red" ? 0 : 1]}`; }
 function labelFor(color, index) { return `${color[0].toUpperCase()}${color.slice(1)}-${LABELS[index]}`; }
+function isComputerTurn() { return Boolean(state?.computer?.[state.current]); }
 
-function makeGame(players, context) {
+function makeGame(players, context, gameOptions = {}) {
   let firstRoll = randomDie();
   let secondRoll = randomDie();
   while (firstRoll === secondRoll) { firstRoll = randomDie(); secondRoll = randomDie(); }
@@ -81,6 +89,7 @@ function makeGame(players, context) {
     players, redPlayer: firstRoll > secondRoll ? 0 : 1, current: firstRoll > secondRoll ? 0 : 1, context,
     samples: { red: [...STARTING_VALUES], blue: [...STARTING_VALUES] }, threshold: 4, deck, hands: [[], []],
     history: [], moves: [], pending: null, result: null, handVisible: false, dieResult: null,
+    computer: gameOptions.computer || [false, false], difficulty: gameOptions.difficulty || "tactician", aiBusy: false,
   };
   for (let index = 0; index < 5; index += 1) { draw(0); draw(1); }
 }
@@ -115,6 +124,88 @@ function evaluateResult(cardType = null) {
 function lastOpponentAction() { return [...state.history].reverse().find((action) => action.player !== state.current); }
 function addMove(text) { state.moves.unshift(text); }
 function startTurn() { state.current = state.current === 0 ? 1 : 0; state.handVisible = false; }
+
+function boardQualifies(samples, threshold, sorted, requiredColor) {
+  const chosen = sorted.slice(0, threshold);
+  return chosen.length === threshold && chosen.every((sample) => sample.color === requiredColor)
+    && chosen.at(-1).value !== sorted[threshold]?.value;
+}
+function boardPotential(samples, threshold, color) {
+  const high = ["red", "blue"].flatMap((group) => samples[group].map((value, index) => ({ color: group, value, index }))).sort((a, b) => b.value - a.value);
+  const low = [...high].reverse();
+  const opponent = color === "red" ? "blue" : "red";
+  const ownTotal = samples[color].reduce((sum, value) => sum + value, 0);
+  const opponentTotal = samples[opponent].reduce((sum, value) => sum + value, 0);
+  const highOwn = high.slice(0, threshold).filter((sample) => sample.color === color).length;
+  const lowOpponent = low.slice(0, threshold).filter((sample) => sample.color === opponent).length;
+  const immediate = boardQualifies(samples, threshold, high, color) || boardQualifies(samples, threshold, low, opponent);
+  const opponentImmediate = boardQualifies(samples, threshold, high, opponent) || boardQualifies(samples, threshold, low, color);
+  return (ownTotal - opponentTotal) * 2 + (highOwn + lowOpponent) * 20 + (immediate ? 10000 : 0) - (opponentImmediate ? 9000 : 0);
+}
+function actionTargets(effect) {
+  if (effect === "swap") return LABELS.map((_, index) => ({ index }));
+  if (["rounding", "contaminated", "outlier", "audit"].includes(effect)) return ["red", "blue"].flatMap((color) => LABELS.map((_, index) => ({ color, index })));
+  return [null];
+}
+function aiCandidates() {
+  const candidates = [];
+  state.hands[state.current].forEach((type, cardIndex) => {
+    let effect = type;
+    if (type === "copy") {
+      const previous = lastOpponentAction();
+      if (!previous || COPY_BLOCKED.has(previous.effect)) return;
+      effect = previous.effect;
+    }
+    if (type === "challenge") {
+      const previous = lastOpponentAction();
+      if (!previous || previous.effect === "decrease") return;
+      candidates.push({ type, effect: "challenge", challengeTarget: previous, cardIndex }); return;
+    }
+    if (effect === "decrease" && state.threshold <= 2) return;
+    actionTargets(effect).forEach((target) => candidates.push({ type, effect, target, cardIndex }));
+  });
+  return candidates;
+}
+function simulatedBoard(candidate) {
+  const samples = structuredClone(state.samples);
+  let threshold = state.threshold;
+  if (candidate.effect === "rounding") samples[candidate.target.color][candidate.target.index] = Math.max(0, Math.min(10, samples[candidate.target.color][candidate.target.index] + (samples[candidate.target.color][candidate.target.index] < 5 ? 1 : -1)));
+  if (candidate.effect === "contaminated") samples[candidate.target.color][candidate.target.index] = 5;
+  if (candidate.effect === "outlier") samples[candidate.target.color][candidate.target.index] = 5;
+  if (candidate.effect === "swap") [samples.red[candidate.target.index], samples.blue[candidate.target.index]] = [samples.blue[candidate.target.index], samples.red[candidate.target.index]];
+  if (candidate.effect === "audit") samples[candidate.target.color][candidate.target.index] = STARTING_VALUES[candidate.target.index];
+  if (candidate.effect === "decrease") threshold -= 1;
+  if (candidate.effect === "challenge") { return { samples: structuredClone(candidate.challengeTarget.before.samples), threshold: candidate.challengeTarget.before.threshold }; }
+  return { samples, threshold };
+}
+function chooseAiMove() {
+  const candidates = aiCandidates();
+  if (!candidates.length) return null;
+  if (state.difficulty === "random") return candidates[Math.floor(Math.random() * candidates.length)];
+  const ownColor = colorForPlayer(state.current);
+  const ranked = candidates.map((candidate) => {
+    const simulated = simulatedBoard(candidate);
+    let score = boardPotential(simulated.samples, simulated.threshold, ownColor);
+    if (state.difficulty === "opportunist") score = score >= 10000 ? 100000 : score <= -9000 ? 90000 : Math.random() * 30;
+    if (state.difficulty === "aggressive") score += (simulated.samples[ownColor].reduce((a, b) => a + b, 0) - simulated.samples[ownColor === "red" ? "blue" : "red"].reduce((a, b) => a + b, 0)) * 3;
+    if (state.difficulty === "oracle") score += boardPotential(state.samples, state.threshold, ownColor) * 0.15 + Math.random() * 4;
+    return { candidate, score };
+  });
+  ranked.sort((a, b) => b.score - a.score);
+  const pool = state.difficulty === "tactician" ? ranked.slice(0, Math.min(3, ranked.length)) : ranked.slice(0, Math.min(2, ranked.length));
+  return pool[Math.floor(Math.random() * pool.length)].candidate;
+}
+function runComputerTurn() {
+  if (!state || state.result || !isComputerTurn()) return;
+  const move = chooseAiMove();
+  state.aiBusy = false;
+  if (move) commit(move.type, move.effect, move.target, move.challengeTarget, move.cardIndex);
+}
+function scheduleComputerTurn() {
+  if (state.result || !isComputerTurn() || state.aiBusy) return;
+  state.aiBusy = true;
+  window.setTimeout(runComputerTurn, 550);
+}
 
 function selectCard(type, cardIndex) {
   if (state.result || !state.handVisible) return;
@@ -191,7 +282,7 @@ function undoLastMove() {
   state.hands[last.player].splice(last.handIndex, 0, last.type);
   state.history.pop();
   state.moves.shift();
-  state.current = last.player;
+  state.current = state.computer[last.player] ? 0 : last.player;
   state.handVisible = true;
   state.pending = null;
   state.dieResult = null;
@@ -212,11 +303,11 @@ function setupScreen() {
   const renderSetup = (selected) => {
     app.innerHTML = `<section class="setup"><h1>P-Hacking: The Game</h1><p>Manipulate the data, defend your theory, and reach significance before your rival does.</p>
       <section class="context-picker"><span class="eyebrow">Research context</span><strong>${selected.title}: ${selected.options[0]} vs. ${selected.options[1]}</strong><button type="button" class="ghost" data-random-context>Choose another random context</button></section>
-      <form id="setup-form"><div class="setup-grid"><label>Player 1 name <input name="one" maxlength="30" value="${defaultNames[0]}" required /></label><label>Player 2 name <input name="two" maxlength="30" value="${defaultNames[1]}" required /></label></div><button type="submit">Begin study</button></form>${rulesReminder()}</section>`;
+      <form id="setup-form"><div class="setup-grid"><label>Player 1 name <input name="one" maxlength="30" value="${defaultNames[0]}" required /></label><label>Player 2 name <input name="two" maxlength="30" value="${defaultNames[1]}" required /></label></div><div class="setup-grid"><label>Game mode <select name="mode"><option value="computer">Single player vs computer</option><option value="local">Two players on this device</option></select></label><label>Computer difficulty <select name="difficulty">${Object.entries(AI_MODES).map(([key, mode]) => `<option value="${key}">${mode.label} — ${mode.description}</option>`).join("")}</select></label></div><button type="submit">Begin study</button></form>${rulesReminder()}</section>`;
     app.querySelector("[data-random-context]").addEventListener("click", () => {
       let next = selected; while (next === selected && CONTEXTS.length > 1) next = CONTEXTS[Math.floor(Math.random() * CONTEXTS.length)]; renderSetup(next);
     });
-    app.querySelector("#setup-form").addEventListener("submit", (event) => { event.preventDefault(); const form = new FormData(event.currentTarget); makeGame([form.get("one").trim(), form.get("two").trim()], selected); render(); });
+    app.querySelector("#setup-form").addEventListener("submit", (event) => { event.preventDefault(); const form = new FormData(event.currentTarget); makeGame([form.get("one").trim(), form.get("two").trim()], selected, { computer: form.get("mode") === "computer" ? [false, true] : [false, false], difficulty: form.get("difficulty") }); render(); });
   };
   renderSetup(CONTEXTS[Math.floor(Math.random() * CONTEXTS.length)]);
 }
@@ -249,9 +340,10 @@ function recentMoves() { return `<section class="panel"><h2>Recent moves</h2>${s
 function render() {
   if (!state) return setupScreen();
   const result = state.result ? `<div class="notice ${state.result.type}">${state.result.type === "win" ? `<strong>${state.result.player} wins the publication.</strong> ${state.result.finding}` : "<strong>Null result.</strong> No researcher achieved a significant result."}</div>` : "";
-  const passScreen = !state.result && !state.handVisible ? `<section class="pass-screen"><p>Pass the device to <strong>${currentPlayer()}</strong>.</p><div class="pass-actions"><button data-show-hand>Show ${currentPlayer()}’s cards</button>${state.history.length ? "<button class=\"ghost\" data-undo>Undo last move</button>" : ""}</div></section>` : "";
+  const computerNotice = !state.result && isComputerTurn() ? `<div class="notice computer-turn"><strong>${currentPlayer()} is thinking…</strong> Difficulty: ${AI_MODES[state.difficulty].label}.</div>` : "";
+  const passScreen = !state.result && !state.handVisible && !isComputerTurn() ? `<section class="pass-screen"><p>Pass the device to <strong>${currentPlayer()}</strong>.</p><div class="pass-actions"><button data-show-hand>Show ${currentPlayer()}’s cards</button>${state.history.length ? "<button class=\"ghost\" data-undo>Undo last move</button>" : ""}</div></section>` : "";
   app.innerHTML = `<div class="shell"><header class="masthead"><div><h1>P-Hacking: The Game</h1><p class="subtitle">A two-researcher race to statistical significance.</p></div><button class="ghost" data-new>New game</button></header>
-    <section class="status"><div class="status-card"><strong>${state.result ? "Study concluded" : `${currentPlayer()}’s turn`}</strong><span>${state.result ? "" : contextRole(state.current)}</span></div><div class="status-card"><strong>${state.deck.length}</strong><span>cards in draw pile</span></div></section>${result}${state.dieResult ? `<div class="die-result">🎲 ${state.dieResult}</div>` : ""}
+    <section class="status"><div class="status-card"><strong>${state.result ? "Study concluded" : `${currentPlayer()}’s turn`}</strong><span>${state.result ? "" : contextRole(state.current)}</span></div><div class="status-card"><strong>${state.deck.length}</strong><span>cards in draw pile</span></div></section>${result}${computerNotice}${state.dieResult ? `<div class="die-result">🎲 ${state.dieResult}</div>` : ""}
     <section class="game-layout"><div class="board-wrap"><div class="board-area"><div class="y-axis-label">${state.context.yAxis}</div><div class="board">${boardPopulation("red")}${boardPopulation("blue")}</div></div></div><aside class="sidebar"><section class="panel"><h2>Significance level</h2><div class="threshold">${[4, 3, 2].map((level) => `<span class="level ${state.threshold === level ? "active" : ""}">${level}</span>`).join("")}</div></section>${recentMoves()}</aside></section>${passScreen}${state.handVisible && !state.result ? hand() : ""}${rulesReminder()}</div>`;
   app.querySelector("[data-new]")?.addEventListener("click", () => { state = null; render(); });
   app.querySelector("[data-show-hand]")?.addEventListener("click", () => { state.handVisible = true; render(); });
@@ -264,5 +356,6 @@ function render() {
   });
   app.querySelectorAll("[data-column]").forEach((button) => button.addEventListener("click", () => chooseColumn(Number(button.dataset.column))));
   app.querySelector("[data-cancel]")?.addEventListener("click", () => { state.pending = null; render(); });
+  scheduleComputerTurn();
 }
 render();
