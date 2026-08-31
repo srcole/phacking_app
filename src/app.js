@@ -91,6 +91,7 @@ function makeGame(players, context, gameOptions = {}) {
     history: [], moves: [], pending: null, result: null, handVisible: false, dieResult: null,
     computer: gameOptions.computer || [false, false], difficulty: gameOptions.difficulty || "tactician", aiBusy: false,
   };
+  state.handVisible = Boolean(state.computer.some(Boolean) && !isComputerTurn());
   for (let index = 0; index < 5; index += 1) { draw(0); draw(1); }
 }
 function flatten() { return ["red", "blue"].flatMap((color) => state.samples[color].map((value, index) => ({ color, value, index }))); }
@@ -123,7 +124,11 @@ function evaluateResult(cardType = null) {
 }
 function lastOpponentAction() { return [...state.history].reverse().find((action) => action.player !== state.current); }
 function addMove(text) { state.moves.unshift(text); }
-function startTurn() { state.current = state.current === 0 ? 1 : 0; state.handVisible = false; }
+function startTurn() {
+  state.current = state.current === 0 ? 1 : 0;
+  // In a computer game, reveal the human hand as soon as the AI finishes its turn.
+  state.handVisible = Boolean(state.computer?.some(Boolean) && !isComputerTurn());
+}
 
 function boardQualifies(samples, threshold, sorted, requiredColor) {
   const chosen = sorted.slice(0, threshold);
@@ -144,7 +149,8 @@ function boardPotential(samples, threshold, color) {
 }
 function actionTargets(effect) {
   if (effect === "swap") return LABELS.map((_, index) => ({ index }));
-  if (["rounding", "contaminated", "outlier", "audit"].includes(effect)) return ["red", "blue"].flatMap((color) => LABELS.map((_, index) => ({ color, index })));
+  if (effect === "rounding") return ["red", "blue"].flatMap((color) => LABELS.flatMap((_, index) => [{ color, index, delta: -1 }, { color, index, delta: 1 }]));
+  if (["contaminated", "outlier", "audit"].includes(effect)) return ["red", "blue"].flatMap((color) => LABELS.map((_, index) => ({ color, index })));
   return [null];
 }
 function aiCandidates() {
@@ -169,7 +175,7 @@ function aiCandidates() {
 function simulatedBoard(candidate) {
   const samples = structuredClone(state.samples);
   let threshold = state.threshold;
-  if (candidate.effect === "rounding") samples[candidate.target.color][candidate.target.index] = Math.max(0, Math.min(10, samples[candidate.target.color][candidate.target.index] + (samples[candidate.target.color][candidate.target.index] < 5 ? 1 : -1)));
+  if (candidate.effect === "rounding") samples[candidate.target.color][candidate.target.index] = Math.max(0, Math.min(10, samples[candidate.target.color][candidate.target.index] + candidate.target.delta));
   if (candidate.effect === "contaminated") samples[candidate.target.color][candidate.target.index] = 5;
   if (candidate.effect === "outlier") samples[candidate.target.color][candidate.target.index] = 5;
   if (candidate.effect === "swap") [samples.red[candidate.target.index], samples.blue[candidate.target.index]] = [samples.blue[candidate.target.index], samples.red[candidate.target.index]];
@@ -256,13 +262,14 @@ function commit(type, effect, target = null, challengeTarget = null, selectedCar
   const handIndex = selectedCardIndex ?? state.pending?.cardIndex ?? state.hands[state.current].indexOf(type);
   if (handIndex < 0) return;
   const before = cloneBoard(); const actor = currentPlayer(); state.dieResult = null;
-  if (effect === "rounding") state.samples[target.color][target.index] += target.delta;
+  if (effect === "rounding") state.samples[target.color][target.index] = Math.max(0, Math.min(10, state.samples[target.color][target.index] + target.delta));
   if (effect === "contaminated") state.samples[target.color][target.index] = 5;
   if (effect === "outlier") { state.samples[target.color][target.index] = randomDie(); state.dieResult = `Outlier-removal die roll: ${state.samples[target.color][target.index]}`; }
   if (effect === "swap") [state.samples.red[target.index], state.samples.blue[target.index]] = [state.samples.blue[target.index], state.samples.red[target.index]];
   if (effect === "audit") state.samples[target.color][target.index] = STARTING_VALUES[target.index];
   if (effect === "decrease") state.threshold -= 1;
   if (effect === "challenge") { state.samples = structuredClone(challengeTarget.before.samples); state.threshold = challengeTarget.before.threshold; }
+  ["red", "blue"].forEach((color) => { state.samples[color] = state.samples[color].map((value) => Number.isFinite(value) ? Math.max(0, Math.min(10, value)) : 0); });
   state.hands[state.current].splice(handIndex, 1);
   const drawnCard = draw(state.current);
   state.history.push({ player: state.current, type, effect, before, handIndex, drawnCard });
@@ -341,7 +348,7 @@ function render() {
   if (!state) return setupScreen();
   const result = state.result ? `<div class="notice ${state.result.type}">${state.result.type === "win" ? `<strong>${state.result.player} wins the publication.</strong> ${state.result.finding}` : "<strong>Null result.</strong> No researcher achieved a significant result."}</div>` : "";
   const computerNotice = !state.result && isComputerTurn() ? `<div class="notice computer-turn"><strong>${currentPlayer()} is thinking…</strong> Difficulty: ${AI_MODES[state.difficulty].label}.</div>` : "";
-  const passScreen = !state.result && !state.handVisible && !isComputerTurn() ? `<section class="pass-screen"><p>Pass the device to <strong>${currentPlayer()}</strong>.</p><div class="pass-actions"><button data-show-hand>Show ${currentPlayer()}’s cards</button>${state.history.length ? "<button class=\"ghost\" data-undo>Undo last move</button>" : ""}</div></section>` : "";
+  const passScreen = !state.result && !state.handVisible && !isComputerTurn() && !state.computer?.some(Boolean) ? `<section class="pass-screen"><p>Pass the device to <strong>${currentPlayer()}</strong>.</p><div class="pass-actions"><button data-show-hand>Show ${currentPlayer()}’s cards</button>${state.history.length ? "<button class=\"ghost\" data-undo>Undo last move</button>" : ""}</div></section>` : "";
   app.innerHTML = `<div class="shell"><header class="masthead"><div><h1>P-Hacking: The Game</h1><p class="subtitle">A two-researcher race to statistical significance.</p></div><button class="ghost" data-new>New game</button></header>
     <section class="status"><div class="status-card"><strong>${state.result ? "Study concluded" : `${currentPlayer()}’s turn`}</strong><span>${state.result ? "" : contextRole(state.current)}</span></div><div class="status-card"><strong>${state.deck.length}</strong><span>cards in draw pile</span></div></section>${result}${computerNotice}${state.dieResult ? `<div class="die-result">🎲 ${state.dieResult}</div>` : ""}
     <section class="game-layout"><div class="board-wrap"><div class="board-area"><div class="y-axis-label">${state.context.yAxis}</div><div class="board">${boardPopulation("red")}${boardPopulation("blue")}</div></div></div><aside class="sidebar"><section class="panel"><h2>Significance level</h2><div class="threshold">${[4, 3, 2].map((level) => `<span class="level ${state.threshold === level ? "active" : ""}">${level}</span>`).join("")}</div></section>${recentMoves()}</aside></section>${passScreen}${state.handVisible && !state.result ? hand() : ""}${rulesReminder()}</div>`;
